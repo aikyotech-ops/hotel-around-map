@@ -798,8 +798,8 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
   const handleInitNewSpot = () => {
     const blankSpot: Partial<Spot> = {
       type: categories[0]?.id ?? '',
-      name: { ja: '', en: '', zh_cn: '', zh_tw: '', ko: '' },
-      description: { ja: '', en: '', zh_cn: '', zh_tw: '', ko: '' },
+      name: { ja: '', en: '' },
+      description: { ja: '', en: '' },
       latitude: hotelConfig.latitude + 0.0005, // slightly off-center by default
       longitude: hotelConfig.longitude + 0.0005,
       tags: [],

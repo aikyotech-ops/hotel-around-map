@@ -149,7 +149,7 @@ function sanitizeImageUrls(value: unknown): string[] {
   );
 }
 
-const LANG_KEYS = ['ja', 'en', 'zh_cn', 'zh_tw', 'ko'] as const;
+const LANG_KEYS = ['ja', 'en'] as const;
 
 function sanitizeMultiLang(value: unknown): MultiLangString {
   const src = (typeof value === 'object' && value !== null ? value : {}) as Record<string, unknown>;

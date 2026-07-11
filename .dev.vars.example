@@ -1,0 +1,5 @@
+# ローカル開発用の環境変数サンプル。
+# このファイルを「.dev.vars」という名前でコピーして、実際のパスワードを設定してください。
+# .dev.vars は .gitignore 済みなので GitHub には公開されません。
+# 本番環境へは: npx wrangler secret put ADMIN_PASSWORD
+ADMIN_PASSWORD=ここに管理画面のパスワードを設定

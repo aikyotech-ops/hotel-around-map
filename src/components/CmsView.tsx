@@ -28,7 +28,11 @@ import {
   ExternalLink,
   Upload
 } from 'lucide-react';
-import { Spot, SystemStats, LANGUAGE_LABELS, LanguageCode, CalendarEvent } from '../types';
+import { Spot, SpotCategory, SystemStats, LANGUAGE_LABELS, LanguageCode, CalendarEvent, DEFAULT_HOTEL_CONFIG, CATEGORY_COLOR_PALETTE, CATEGORY_EMOJI_PALETTE } from '../types';
+import { formatCalendarEventDate } from '../utils';
+
+// sessionStorage key that keeps staff logged in until the browser tab is closed.
+const ADMIN_TOKEN_STORAGE_KEY = 'concierge_admin_token';
 
 interface CmsViewProps {
   onBackToGuest: () => void;
@@ -44,7 +48,7 @@ interface GeocodeResult {
 // address and pick the matched coordinates, instead of guessing/typing lat/lng by hand
 // (the source of the small coordinate drift reported by the user). Uses the free, key-less
 // GSI (国土地理院) address geocoder via /api/geocode.
-function AddressSearchBox({ onSelect }: { onSelect: (lat: number, lng: number) => void }) {
+function AddressSearchBox({ onSelect, adminToken }: { onSelect: (lat: number, lng: number) => void; adminToken: string }) {
   const [query, setQuery] = useState<string>('');
   const [results, setResults] = useState<GeocodeResult[]>([]);
   const [isSearching, setIsSearching] = useState<boolean>(false);
@@ -56,7 +60,9 @@ function AddressSearchBox({ onSelect }: { onSelect: (lat: number, lng: number) =
     setError('');
     setResults([]);
     try {
-      const res = await fetch(`/api/geocode?q=${encodeURIComponent(query.trim())}`);
+      const res = await fetch(`/api/geocode?q=${encodeURIComponent(query.trim())}`, {
+        headers: { 'x-admin-token': adminToken },
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '住所検索に失敗しました');
       if (data.length === 0) setError('該当する住所が見つかりませんでした。');
@@ -92,7 +98,7 @@ function AddressSearchBox({ onSelect }: { onSelect: (lat: number, lng: number) =
       </div>
       {error && <p className="text-[10px] text-rose-600 font-semibold">{error}</p>}
       {results.length > 0 && (
-        <div className="space-y-0.5 max-h-32 overflow-y-auto border border-slate-150 rounded-lg divide-y divide-slate-100">
+        <div className="space-y-0.5 max-h-32 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
           {results.map((r, i) => (
             <button
               type="button"
@@ -112,24 +118,246 @@ function AddressSearchBox({ onSelect }: { onSelect: (lat: number, lng: number) =
       )}
     </div>
   );
+}// A small palette swatch grid staff pick from, rather than a free-form color/emoji input.
+// Colors are shown as solid swatches (inline style, since they're arbitrary hex values);
+// emoji are shown as their literal character on a neutral background.
+function PaletteGrid({ options, value, onSelect, kind }: {
+  options: string[];
+  value: string;
+  onSelect: (v: string) => void;
+  kind: 'color' | 'emoji';
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {options.map(opt => (
+        <button
+          key={opt}
+          type="button"
+          onClick={() => onSelect(opt)}
+          style={kind === 'color' ? { backgroundColor: opt } : undefined}
+          className={`w-8 h-8 rounded-lg border-2 flex items-center justify-center text-base transition ${
+            value === opt ? 'border-slate-900 scale-110' : 'border-transparent hover:border-slate-300'
+          } ${kind === 'emoji' ? 'bg-slate-50' : ''}`}
+        >
+          {kind === 'emoji' ? opt : ''}
+        </button>
+      ))}
+    </div>
+  );
 }
 
+// Staff-managed, extensible spot categories: add/edit/delete a category (label + a color
+// and emoji picked from a curated palette), used both for the spot type selector below and
+// to drive pin color/emoji on the guest map so they can never drift out of sync.
+function CategoryManager({ categories, adminFetch, onChange }: {
+  categories: SpotCategory[];
+  adminFetch: (input: string, init?: RequestInit) => Promise<Response>;
+  onChange: () => void;
+}) {
+  const [editingId, setEditingId] = useState<string | 'new' | null>(null);
+  const [draftLabel, setDraftLabel] = useState('');
+  const [draftColor, setDraftColor] = useState<string>(CATEGORY_COLOR_PALETTE[0]);
+  const [draftEmoji, setDraftEmoji] = useState<string>(CATEGORY_EMOJI_PALETTE[0]);
+  const [error, setError] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  const startAdd = () => {
+    setEditingId('new');
+    setDraftLabel('');
+    setDraftColor(CATEGORY_COLOR_PALETTE[categories.length % CATEGORY_COLOR_PALETTE.length]);
+    setDraftEmoji(CATEGORY_EMOJI_PALETTE[0]);
+    setError('');
+  };
+
+  const startEdit = (cat: SpotCategory) => {
+    setEditingId(cat.id);
+    setDraftLabel(cat.label);
+    setDraftColor(cat.color);
+    setDraftEmoji(cat.emoji);
+    setError('');
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setError('');
+  };
+
+  const handleSave = async () => {
+    if (!draftLabel.trim()) {
+      setError('カテゴリ名を入力してください。');
+      return;
+    }
+    setIsSaving(true);
+    setError('');
+    try {
+      const isNew = editingId === 'new';
+      const url = isNew ? '/api/categories' : `/api/categories/${editingId}`;
+      const res = await adminFetch(url, {
+        method: isNew ? 'POST' : 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: draftLabel.trim(), color: draftColor, emoji: draftEmoji }),
+      });
+      if (res.ok) {
+        setEditingId(null);
+        onChange();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error || '保存に失敗しました。');
+      }
+    } catch {
+      setError('通信に失敗しました。');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async (cat: SpotCategory) => {
+    if (!confirm(`「${cat.label}」を削除してもよろしいですか？`)) return;
+    const res = await adminFetch(`/api/categories/${cat.id}`, { method: 'DELETE' });
+    if (res.ok) {
+      onChange();
+    } else {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || '削除に失敗しました。');
+    }
+  };
+
+  const editorForm = (
+    <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-2.5">
+      <input
+        type="text"
+        placeholder="例: カフェ、温泉、体験プログラム"
+        value={draftLabel}
+        onChange={(e) => setDraftLabel(e.target.value)}
+        className="w-full px-3 py-2 rounded-lg text-xs border border-slate-200 focus:outline-none focus:ring-2 focus:ring-slate-900"
+      />
+      <div>
+        <span className="block text-[10px] font-semibold text-slate-500 mb-1">色を選択</span>
+        <PaletteGrid
+          options={CATEGORY_COLOR_PALETTE}
+          value={draftColor}
+          onSelect={setDraftColor}
+          kind="color"
+        />
+      </div>
+      <div>
+        <span className="block text-[10px] font-semibold text-slate-500 mb-1">絵文字を選択</span>
+        <PaletteGrid
+          options={CATEGORY_EMOJI_PALETTE}
+          value={draftEmoji}
+          onSelect={setDraftEmoji}
+          kind="emoji"
+        />
+      </div>
+      {error && <p className="text-[10px] text-rose-600 font-semibold">{error}</p>}
+      <div className="flex justify-end gap-2 pt-1">
+        <button type="button" onClick={cancelEdit} className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-500 hover:bg-slate-100">
+          キャンセル
+        </button>
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={isSaving}
+          className="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-900 text-white hover:bg-slate-800 disabled:bg-slate-300 flex items-center gap-1"
+        >
+          {isSaving && <Loader2 className="w-3 h-3 animate-spin" />} 保存
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-2">
+      {categories.map(cat => (
+        <div key={cat.id}>
+          {editingId === cat.id ? editorForm : (
+            <div className="flex items-center gap-2 border border-slate-100 rounded-xl px-3 py-2">
+              <span
+                className="w-7 h-7 rounded-lg flex items-center justify-center text-sm shrink-0"
+                style={{ backgroundColor: cat.color }}
+              >
+                {cat.emoji}
+              </span>
+              <span className="flex-1 text-xs font-bold text-slate-700 truncate">{cat.label}</span>
+              <button type="button" onClick={() => startEdit(cat)} className="p-1 text-slate-400 hover:text-slate-700">
+                <Edit className="w-3.5 h-3.5" />
+              </button>
+              <button type="button" onClick={() => handleDelete(cat)} className="p-1 text-slate-400 hover:text-rose-600">
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {editingId === 'new' ? editorForm : (
+        <button
+          type="button"
+          onClick={startAdd}
+          className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-bold text-slate-500 border border-dashed border-slate-300 hover:bg-slate-50"
+        >
+          <Plus className="w-3.5 h-3.5" /> 新しいカテゴリを追加
+        </button>
+      )}
+    </div>
+  );
+}
 
 export default function CmsView({ onBackToGuest }: CmsViewProps) {
-  // Login Gate
+  // Login gate. The password is verified by the server (/api/login, checked against the
+  // ADMIN_PASSWORD secret) and then sent with every data-changing request via the
+  // x-admin-token header — nothing password-like is hardcoded in this client code.
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [adminToken, setAdminToken] = useState<string>(() => {
+    try { return sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || ''; } catch { return ''; }
+  });
   const [loginPassword, setLoginPassword] = useState<string>('');
   const [loginError, setLoginError] = useState<string>('');
+  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+
+  const handleAuthExpired = () => {
+    try { sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY); } catch {}
+    setAdminToken('');
+    setIsAuthenticated(false);
+    alert('認証が無効になりました（パスワード変更など）。再度ログインしてください。');
+  };
+
+  // fetch wrapper for admin-only APIs: attaches the token and logs out on auth failure
+  const adminFetch = async (input: string, init: RequestInit = {}): Promise<Response> => {
+    const res = await fetch(input, {
+      ...init,
+      headers: { ...(init.headers || {}), 'x-admin-token': adminToken },
+    });
+    if (res.status === 401) handleAuthExpired();
+    return res;
+  };
+
+  // Restore the session after a reload: re-verify the stored token with the server.
+  useEffect(() => {
+    if (!adminToken || isAuthenticated) return;
+    (async () => {
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: adminToken }),
+        });
+        if (res.ok) {
+          setIsAuthenticated(true);
+        } else {
+          try { sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY); } catch {}
+          setAdminToken('');
+        }
+      } catch {}
+    })();
+  }, []);
 
   // Hotel core settings
-  const [hotelConfig, setHotelConfig] = useState({
-    name: 'ラ・ロンコントル',
-    latitude: 33.833395132000696,
-    longitude: 132.76678651517162,
-  });
+  const [hotelConfig, setHotelConfig] = useState({ ...DEFAULT_HOTEL_CONFIG });
 
   // DB datasets
   const [spots, setSpots] = useState<Spot[]>([]);
+  const [categories, setCategories] = useState<SpotCategory[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   const [stats, setStats] = useState<SystemStats>({
     pvCount: 0,
@@ -154,7 +382,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
   const handleExternalRefresh = async () => {
     setIsRefreshingExternal(true);
     try {
-      const res = await fetch('/api/spots/external-refresh', { method: 'POST' });
+      const res = await adminFetch('/api/spots/external-refresh', { method: 'POST' });
       const data = await res.json();
       if (res.ok) {
         alert(
@@ -180,7 +408,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
     try {
       const formData = new FormData();
       formData.append('image', file);
-      const res = await fetch('/api/upload', { method: 'POST', body: formData });
+      const res = await adminFetch('/api/upload', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || '画像のアップロードに失敗しました');
@@ -378,6 +606,12 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
       if (evRes.ok) {
         setCalendarEvents(await evRes.json());
       }
+
+      // 5. Fetch spot categories (drives the type selector, table badges, and the guest map's pins/filter)
+      const catRes = await fetch('/api/categories');
+      if (catRes.ok) {
+        setCategories(await catRes.json());
+      }
     } catch (e) {
       console.error('Failed to load CMS data:', e);
     }
@@ -457,14 +691,30 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
     }
   };
 
-  // Submit Password
-  const handleLoginSubmit = (e: React.FormEvent) => {
+  // Submit Password (verified server-side against the ADMIN_PASSWORD secret)
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (loginPassword === 'admin') {
-      setIsAuthenticated(true);
-      setLoginError('');
-    } else {
-      setLoginError('パスワードが正しくありません (ヒント: admin と入力してください)');
+    setIsLoggingIn(true);
+    setLoginError('');
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: loginPassword }),
+      });
+      const data = await res.json().catch(() => ({} as { error?: string }));
+      if (res.ok) {
+        try { sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, loginPassword); } catch {}
+        setAdminToken(loginPassword);
+        setIsAuthenticated(true);
+        setLoginPassword('');
+      } else {
+        setLoginError(data.error || 'ログインに失敗しました。');
+      }
+    } catch {
+      setLoginError('通信に失敗しました。ネットワーク接続をご確認ください。');
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
@@ -472,7 +722,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
   const handleUpdateHotel = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const res = await fetch('/api/hotel', {
+      const res = await adminFetch('/api/hotel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(hotelConfig)
@@ -499,7 +749,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
     const method = isNew ? 'POST' : 'PUT';
 
     try {
-      const res = await fetch(url, {
+      const res = await adminFetch(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(currentSpot)
@@ -521,7 +771,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
   const handleDeleteSpot = async (id: string) => {
     if (!confirm('このスポット情報を削除してもよろしいですか？')) return;
     try {
-      const res = await fetch(`/api/spots/${id}`, { method: 'DELETE' });
+      const res = await adminFetch(`/api/spots/${id}`, { method: 'DELETE' });
       if (res.ok) {
         fetchCmsData();
       } else {
@@ -539,15 +789,15 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
     const enName = (spot.name.en || '').toLowerCase();
     const valMatched = jaName.includes(q) || enName.includes(q);
     const tagMatched = spot.tags.some(tag => tag.toLowerCase().includes(q));
-    const typeMatched = spot.type.toLowerCase().includes(q);
-    return valMatched || tagMatched || typeMatched;
+    const categoryLabel = categories.find(c => c.id === spot.type)?.label.toLowerCase() ?? '';
+    return valMatched || tagMatched || categoryLabel.includes(q);
   });
 
-  // Setup blank initial spot for Creating form
+  // Setup blank initial spot for Creating form. Pre-selects the first category so the type
+  // selector always shows a visible, changeable selection rather than looking unset.
   const handleInitNewSpot = () => {
     const blankSpot: Partial<Spot> = {
-      type: 'restaurant',
-      source: 'hotel_master',
+      type: categories[0]?.id ?? '',
       name: { ja: '', en: '', zh_cn: '', zh_tw: '', ko: '' },
       description: { ja: '', en: '', zh_cn: '', zh_tw: '', ko: '' },
       latitude: hotelConfig.latitude + 0.0005, // slightly off-center by default
@@ -601,12 +851,14 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
               </div>
             )}
 
-            <button 
+            <button
               id="cms-login-submit"
               type="submit"
-              className="w-full bg-indigo-900 hover:bg-indigo-950 text-white font-bold py-3 px-4 rounded-xl shadow-lg transition duration-150 text-xs cursor-pointer tracking-wider uppercase"
+              disabled={isLoggingIn}
+              className="w-full bg-indigo-900 hover:bg-indigo-950 disabled:bg-slate-300 text-white font-bold py-3 px-4 rounded-xl shadow-lg transition duration-150 text-xs cursor-pointer tracking-wider uppercase flex items-center justify-center gap-2"
             >
-              ログイン
+              {isLoggingIn && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              {isLoggingIn ? '認証中...' : 'ログイン'}
             </button>
           </form>
 
@@ -676,19 +928,19 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                 </div>
               </div>
 
-              <div className="text-[10px] text-slate-400 border-t border-slate-150 pt-3 flex justify-between">
+              <div className="text-[10px] text-slate-400 border-t border-slate-200 pt-3 flex justify-between">
                 <span>最終更新日時:</span>
                 <span className="font-mono font-medium">{stats.lastUpdated !== '-' ? new Date(stats.lastUpdated).toLocaleString() : '-'}</span>
               </div>
 
               {/* FREE EXTERNAL AUTO-PICKUP: OpenStreetMap + RSS, no AI API key required */}
-              <div className="mt-4 pt-3 border-t border-slate-150">
+              <div className="mt-4 pt-3 border-t border-slate-200">
                 <button
                   id="btn-auto-refresh-external"
                   type="button"
                   onClick={handleExternalRefresh}
                   disabled={isRefreshingExternal}
-                  className="w-full bg-gradient-to-r from-sky-600 to-blue-700 hover:from-sky-700 hover:to-blue-800 text-white text-xs font-bold py-3 px-4 rounded-xl shadow-lg transition duration-150 flex items-center justify-center cursor-pointer disabled:from-slate-150 disabled:to-slate-200 disabled:text-slate-400"
+                  className="w-full bg-gradient-to-r from-sky-600 to-blue-700 hover:from-sky-700 hover:to-blue-800 text-white text-xs font-bold py-3 px-4 rounded-xl shadow-lg transition duration-150 flex items-center justify-center cursor-pointer disabled:from-slate-200 disabled:to-slate-200 disabled:text-slate-400"
                 >
                   {isRefreshingExternal ? (
                     <>
@@ -723,7 +975,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                       <p className="font-bold text-slate-700 leading-snug">{ev.title}</p>
                       <div className="flex items-center justify-between mt-1">
                         <span className="text-[10px] text-slate-400">
-                          {ev.publishedAt ? new Date(ev.publishedAt).toLocaleDateString('ja-JP') : '日付不明'}
+                          {formatCalendarEventDate(ev, 'ja-JP') || '日付不明'}
                         </span>
                         {ev.link && (
                           <a href={ev.link} target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:underline inline-flex items-center text-[10px] font-bold">
@@ -738,6 +990,19 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
               <p className="text-[9px] text-slate-400 mt-3 leading-relaxed">
                 ※ RSSフィードには会場の正確な位置情報が含まれないため、地図にピン留めせずカレンダー形式でゲスト画面にも表示されます。
               </p>
+            </div>
+
+            {/* 1C. CATEGORY MANAGEMENT: the color/emoji picked here is exactly what the guest
+                map uses for that category's pins and filter chip, so they can't drift apart. */}
+            <div className="bg-white rounded-3xl p-6 border border-slate-200 shadow-sm">
+              <h2 className="text-xs font-bold font-mono uppercase text-slate-400 tracking-wider mb-3 flex items-center">
+                <Sparkles className="w-4 h-4 text-amber-500 mr-1.5" />
+                スポットの種類（カテゴリ）管理
+              </h2>
+              <p className="text-[10px] text-slate-400 mb-3 leading-relaxed">
+                ここで追加・編集した色と絵文字が、ゲスト画面の地図ピンと絞り込みボタンにそのまま使われます。
+              </p>
+              <CategoryManager categories={categories} adminFetch={adminFetch} onChange={fetchCmsData} />
             </div>
 
             {/* 2. CORE QR SYSTEM CARD */}
@@ -760,19 +1025,19 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                     id="qr-code-img"
                   />
                 ) : (
-                  <div className="w-32 h-32 flex items-center justify-center text-slate-350 text-xs font-medium bg-slate-50 rounded-lg">QR作成中...</div>
+                  <div className="w-32 h-32 flex items-center justify-center text-slate-300 text-xs font-medium bg-slate-50 rounded-lg">QR作成中...</div>
                 )}
                 <canvas ref={qrCanvasRef} className="hidden" />
               </div>
 
-              <span className="text-[10px] font-mono bg-slate-100 text-slate-500 px-3 py-1 rounded-full border border-slate-150 mb-3 max-w-full truncate">
+              <span className="text-[10px] font-mono bg-slate-100 text-slate-500 px-3 py-1 rounded-full border border-slate-200 mb-3 max-w-full truncate">
                 {qrUrl}
               </span>
 
               <button
                 id="btn-cms-qr-download"
                 onClick={handleDownloadQr}
-                className="w-full bg-slate-900 hover:bg-slate-805 text-white text-xs font-bold rounded-xl py-2.5 px-3 flex items-center justify-center shadow cursor-pointer transition"
+                className="w-full bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl py-2.5 px-3 flex items-center justify-center shadow cursor-pointer transition"
               >
                 <Download className="w-3.5 h-3.5 mr-1" /> QR コード画像をダウンロード
               </button>
@@ -825,7 +1090,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                   </div>
                 </div>
 
-                <AddressSearchBox onSelect={(lat, lng) => setHotelConfig(prev => ({ ...prev, latitude: lat, longitude: lng }))} />
+                <AddressSearchBox adminToken={adminToken} onSelect={(lat, lng) => setHotelConfig(prev => ({ ...prev, latitude: lat, longitude: lng }))} />
 
                 {/* Hotel Location Interactive Map */}
                 <div className="space-y-1">
@@ -840,9 +1105,9 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                 <button
                   id="btn-cms-hotel-save"
                   type="submit"
-                  className="w-full bg-slate-100 hover:bg-slate-200 text-slate-150 border border-slate-200 text-slate-700 text-xs font-bold py-2.5 px-3 rounded-xl flex items-center justify-center transition cursor-pointer"
+                  className="w-full bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 text-xs font-bold py-2.5 px-3 rounded-xl flex items-center justify-center transition cursor-pointer"
                 >
-                  <Save className="w-3.5 h-3.5 mr-1 text-slate-550" /> 基本設定を保存
+                  <Save className="w-3.5 h-3.5 mr-1 text-slate-500" /> 基本設定を保存
                 </button>
               </form>
             </div>
@@ -880,6 +1145,41 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
 
               {/* Form Input fields */}
               <form onSubmit={handleSaveSpot} className="space-y-6">
+
+                {/* 1. ROW-GROUP: TYPE SELECTOR (staff must choose; no more silent default).
+                    Categories are managed in the "カテゴリ管理" card on the left — the same
+                    color shown here is what the guest map's pin and filter chip both use. */}
+                <div className="bg-slate-50 border border-slate-100 rounded-2xl p-5 space-y-3">
+                  <h3 className="text-xs font-bold text-slate-700 flex items-center mb-1">
+                    <MapPin className="w-4 h-4 text-slate-600 mr-1.5" />
+                    種類 <span className="text-rose-500 ml-1">*必須</span>
+                  </h3>
+                  <div className="flex flex-wrap gap-2">
+                    {categories.length === 0 && (
+                      <p className="text-[11px] text-slate-400">先に左側の「カテゴリ管理」でカテゴリを追加してください。</p>
+                    )}
+                    {categories.map(cat => {
+                      const isSelected = currentSpot.type === cat.id;
+                      return (
+                        <button
+                          key={cat.id}
+                          type="button"
+                          id={`btn-spot-type-${cat.id}`}
+                          onClick={() => setCurrentSpot({ ...currentSpot, type: cat.id })}
+                          style={isSelected ? { backgroundColor: cat.color, borderColor: cat.color } : undefined}
+                          className={`px-3 py-2.5 rounded-xl text-xs font-bold border flex items-center gap-1.5 transition-colors ${
+                            isSelected
+                              ? 'text-white'
+                              : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                          }`}
+                        >
+                          <span>{cat.emoji}</span>
+                          {cat.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
 
                 {/* 2. ROW-GROUP: NAME CARD */}
                 <div className="bg-slate-50 border border-slate-100 rounded-2xl p-5 space-y-4">
@@ -966,7 +1266,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                     </div>
                   </div>
 
-                  <AddressSearchBox onSelect={(lat, lng) => setCurrentSpot(prev => prev ? { ...prev, latitude: lat, longitude: lng } : prev)} />
+                  <AddressSearchBox adminToken={adminToken} onSelect={(lat, lng) => setCurrentSpot(prev => prev ? { ...prev, latitude: lat, longitude: lng } : prev)} />
 
                   <div className="pt-2 border-t border-slate-200/60">
                     <label className="block text-[11px] font-semibold text-slate-500 mb-1">Googleマップ URL (任意)</label>
@@ -1048,7 +1348,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                         type="date"
                         value={currentSpot.event_start_at || ''}
                         onChange={(e) => setCurrentSpot({ ...currentSpot, event_start_at: e.target.value })}
-                        className="w-full px-4 py-2.5 rounded-xl border border-rose-200 bg-white text-sm text-ros-900 focus:outline-none focus:ring-2 focus:ring-rose-500 font-mono"
+                        className="w-full px-4 py-2.5 rounded-xl border border-rose-200 bg-white text-sm text-rose-900 focus:outline-none focus:ring-2 focus:ring-rose-500 font-mono"
                       />
                     </div>
                     <div>
@@ -1057,7 +1357,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                         type="date"
                         value={currentSpot.event_end_at || ''}
                         onChange={(e) => setCurrentSpot({ ...currentSpot, event_end_at: e.target.value })}
-                        className="w-full px-4 py-2.5 rounded-xl border border-rose-200 bg-white text-sm text-ros-900 focus:outline-none focus:ring-2 focus:ring-rose-500 font-mono"
+                        className="w-full px-4 py-2.5 rounded-xl border border-rose-200 bg-white text-sm text-rose-900 focus:outline-none focus:ring-2 focus:ring-rose-500 font-mono"
                       />
                     </div>
                   </div>
@@ -1078,7 +1378,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                   <button
                     id="btn-cms-spot-submit"
                     type="submit"
-                    className="px-6 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-900 hover:text-white border border-slate-250 hover:border-slate-900 text-slate-850 font-bold transition text-xs font-sans flex items-center cursor-pointer"
+                    className="px-6 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-900 hover:text-white border border-slate-200 hover:border-slate-900 text-slate-800 font-bold transition text-xs font-sans flex items-center cursor-pointer"
                   >
                     <Check className="w-4 h-4 mr-1.5" />
                     スポット情報を保存・一括公開する
@@ -1095,7 +1395,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
               {/* List Header control row */}
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
                 <div>
-                  <h2 className="text-base font-bold text-slate-905">
+                  <h2 className="text-base font-bold text-slate-900">
                     登録済みホテル周辺スポット・観光イベント一覧
                   </h2>
                   <p className="text-xs text-slate-400 mt-1">
@@ -1105,7 +1405,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                 <button
                   id="btn-cms-init-new"
                   onClick={handleInitNewSpot}
-                  className="flex bg-slate-900 hover:bg-slate-805 text-white text-xs font-bold py-2.5 px-4 rounded-xl shadow transition duration-150 shrink-0 cursor-pointer"
+                  className="flex bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold py-2.5 px-4 rounded-xl shadow transition duration-150 shrink-0 cursor-pointer"
                 >
                   <Plus className="w-4.5 h-4.5 mr-1" /> 新しいスポットを追加
                 </button>
@@ -1127,67 +1427,61 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse">
                   <thead>
-                    <tr className="border-b border-slate-150 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50/50">
+                    <tr className="border-b border-slate-200 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50/50">
                       <th className="py-3 px-4">外観</th>
                       <th className="py-3 px-4">種類</th>
-                      <th className="py-3 px-4">表示種別</th>
                       <th className="py-3 px-4">スポット名（日英）</th>
                       <th className="py-3 px-4">経緯度座標</th>
-                      <th className="py-3 px-4">現在ステータス</th>
                       <th className="py-3 px-4 text-right">管理操作</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-xs">
                     {filteredSpots.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="text-center py-10 text-slate-400 font-medium">
+                        <td colSpan={5} className="text-center py-10 text-slate-400 font-medium">
                           検索条件に該当するスポットが見つかりません。
                         </td>
                       </tr>
                     ) : (
                       filteredSpots.map(spot => {
-                        const isEvent = spot.type === 'event';
-                        const isStaff = spot.source === 'hotel_master';
-                        const isActive = spot.status === 'active';
-                        
+                        const category = categories.find(c => c.id === spot.type);
+
                         return (
                           <tr key={spot.id} className="hover:bg-slate-50/50 duration-100">
-                            {/* Spot small card photo icon */}
+                            {/* Spot small card photo icon: no stock-photo fallback, so an
+                                untouched spot honestly shows an empty thumbnail. */}
                             <td className="py-3.5 px-4">
-                              <img 
-                                src={(spot.image_urls && spot.image_urls[0]) || 'https://images.unsplash.com/photo-1542051841857-5f90071e7989?w=100'} 
-                                alt={spot.name.ja} 
-                                className="w-10 h-8 rounded object-cover border border-slate-200 shrink-0"
-                                referrerPolicy="no-referrer"
-                              />
+                              {spot.image_urls && spot.image_urls[0] ? (
+                                <img
+                                  src={spot.image_urls[0]}
+                                  alt={spot.name.ja}
+                                  className="w-10 h-8 rounded object-cover border border-slate-200 shrink-0"
+                                  referrerPolicy="no-referrer"
+                                />
+                              ) : (
+                                <div className="w-10 h-8 rounded border border-slate-200 bg-slate-50 shrink-0 flex items-center justify-center">
+                                  <ImageIcon className="w-3.5 h-3.5 text-slate-300" />
+                                </div>
+                              )}
                             </td>
-                            {/* Type classification */}
+                            {/* Type classification: color/emoji come from the category the
+                                spot references, same as the guest map's pins and filter chips */}
                             <td className="py-3.5 px-4">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                spot.type === 'restaurant' 
-                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' 
-                                  : isEvent 
-                                    ? 'bg-rose-50 text-rose-700 border border-rose-100' 
-                                    : 'bg-purple-50 text-purple-700 border border-purple-100'
-                              }`}>
-                                {spot.type === 'restaurant' ? '和食・グルメ' : isEvent ? '特別イベント' : '観光スポット'}
-                              </span>
-                            </td>
-                            {/* Star Pin badge indication */}
-                            <td className="py-3.5 px-4">
-                              {isStaff ? (
-                                <span className="bg-amber-50 text-amber-800 border border-amber-200/50 rounded-full px-2.5 py-0.5 text-[9px] font-bold inline-flex items-center">
-                                  ★ ホテル厳選
+                              {category ? (
+                                <span
+                                  className="px-2 py-0.5 rounded text-[10px] font-bold inline-flex items-center gap-1"
+                                  style={{ backgroundColor: `${category.color}1a`, color: category.color }}
+                                >
+                                  <span>{category.emoji}</span>
+                                  {category.label}
                                 </span>
                               ) : (
-                                <span className="bg-slate-100 text-slate-500 rounded-full px-2.5 py-0.5 text-[9px] font-bold">
-                                  一般スポット
-                                </span>
+                                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-400">不明</span>
                               )}
                             </td>
                             {/* Name translations */}
                             <td className="py-3.5 px-4 font-sans">
-                              <p className="font-bold text-slate-850">{spot.name.ja}</p>
+                              <p className="font-bold text-slate-800">{spot.name.ja}</p>
                               {spot.name.en && <p className="text-[10px] text-slate-400 mt-0.5">{spot.name.en}</p>}
                             </td>
                             {/* Coords lookup */}
@@ -1204,24 +1498,13 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                                 </a>
                               )}
                             </td>
-                            {/* Status logic */}
-                            <td className="py-3.5 px-4">
-                              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[9px] font-bold ${
-                                isActive 
-                                  ? 'bg-emerald-100 text-emerald-800' 
-                                  : 'bg-slate-100/80 text-slate-400'
-                              }`}>
-                                <span className={`w-1.5 h-1.5 rounded-full mr-1 ${isActive ? 'bg-emerald-500' : 'bg-slate-350'}`}></span>
-                                {isActive ? '公開中' : '非公開'}
-                              </span>
-                            </td>
                             {/* Actions CRUD buttons */}
                             <td className="py-3.5 px-4 text-right">
                               <div className="inline-flex space-x-2">
                                 <button
                                   id={`edit-spot-${spot.id}`}
                                   onClick={() => handleInitEditSpot(spot)}
-                                  className="p-1 px-2 text-[10px] font-bold text-slate-650 hover:text-slate-900 bg-slate-50 border border-slate-200 hover:border-slate-350 duration-100 rounded flex items-center"
+                                  className="p-1 px-2 text-[10px] font-bold text-slate-600 hover:text-slate-900 bg-slate-50 border border-slate-200 hover:border-slate-300 duration-100 rounded flex items-center"
                                   title="情報編集"
                                 >
                                   <Edit className="w-3 h-3 mr-0.5" /> 編集
@@ -1229,7 +1512,7 @@ export default function CmsView({ onBackToGuest }: CmsViewProps) {
                                 <button
                                   id={`delete-spot-${spot.id}`}
                                   onClick={() => handleDeleteSpot(spot.id)}
-                                  className="p-1 px-2 text-[10px] font-bold text-rose-600 hover:text-rose-900 bg-rose-50 border border-rose-100 hover:border-rose-250 duration-105 rounded flex items-center"
+                                  className="p-1 px-2 text-[10px] font-bold text-rose-600 hover:text-rose-900 bg-rose-50 border border-rose-100 hover:border-rose-200 duration-100 rounded flex items-center"
                                   title="スポットを削除"
                                 >
                                   <Trash2 className="w-3 h-3 mr-0.5" /> 削除

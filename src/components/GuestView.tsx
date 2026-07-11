@@ -23,13 +23,25 @@ import {
   Maximize2,
   Navigation,
   Globe,
-  Info
+  Info,
+  ImageOff
 } from 'lucide-react';
-import { Spot, CalendarEvent, LanguageCode, UI_TRANSLATIONS, LANGUAGE_LABELS, TAG_LABEL_TRANSLATIONS } from '../types';
+import { Spot, SpotCategory, CalendarEvent, LanguageCode, UI_TRANSLATIONS, LANGUAGE_LABELS, TAG_LABEL_TRANSLATIONS, DEFAULT_HOTEL_CONFIG } from '../types';
+import { formatCalendarEventDate } from '../utils';
 
-interface GuestViewProps {
-  onGoToCms: () => void;
-}
+// Fallback for a spot whose category was somehow deleted out from under it.
+const UNKNOWN_CATEGORY: SpotCategory = { id: '', label: '?', color: '#94a3b8', emoji: '❓', sortOrder: 999 };
+
+// Spot names / hotel name are staff-entered text that gets inlined into Leaflet
+// popup/tooltip HTML strings, so it must be escaped to keep any markup inert.
+const escapeHtml = (s: string): string =>
+  s.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[ch]);
+
+// Only open real web links; blocks javascript: and other executable URL schemes.
+const safeHttpUrl = (u?: string): string | null => {
+  const trimmed = u?.trim();
+  return trimmed && /^https?:\/\//i.test(trimmed) ? trimmed : null;
+};
 
 // Kyoto Gion Coordinates
 interface Coords {
@@ -39,7 +51,7 @@ interface Coords {
 
 const LANG_STORAGE_KEY = 'concierge_lang';
 
-export default function GuestView({ onGoToCms }: GuestViewProps) {
+export default function GuestView() {
   const [lang, setLang] = useState<LanguageCode>(() => {
     try {
       const saved = localStorage.getItem(LANG_STORAGE_KEY) as LanguageCode | null;
@@ -57,17 +69,18 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
     } catch {}
   }, [lang]);
 
-  const [hotelConfig, setHotelConfig] = useState({
-    name: 'ラ・ロンコントル',
-    latitude: 33.833395132000696,
-    longitude: 132.76678651517162,
-  });
+  const [hotelConfig, setHotelConfig] = useState({ ...DEFAULT_HOTEL_CONFIG });
 
   const [spots, setSpots] = useState<Spot[]>([]);
+  const [categories, setCategories] = useState<SpotCategory[]>([]);
+  const getCategory = (id: string): SpotCategory => categories.find(c => c.id === id) ?? UNKNOWN_CATEGORY;
+  const [typeFilter, setTypeFilter] = useState<string>('all');
+  const visibleSpots = typeFilter === 'all' ? spots : spots.filter(s => s.type === typeFilter);
   const [selectedSpot, setSelectedSpot] = useState<Spot | null>(null);
   const [sheetVisible, setSheetVisible] = useState(false);
   const sheetY = useMotionValue(0);
   const dragControls = useDragControls();
+  const calendarDragControls = useDragControls();
 
   useEffect(() => {
     if (selectedSpot) {
@@ -113,6 +126,11 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
         // Filters active spots
         const activeSpots = data.filter((s: Spot) => s.status === 'active');
         setSpots(activeSpots);
+      }
+
+      const catRes = await fetch('/api/categories');
+      if (catRes.ok) {
+        setCategories(await catRes.json());
       }
 
       // Auto-fetched local events without a reliable venue location: shown as a calendar
@@ -180,7 +198,7 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
 
     const hotelMarker = L.marker([hotelConfig.latitude, hotelConfig.longitude], { icon: hotelIcon })
       .addTo(map)
-      .bindTooltip(hotelConfig.name, { permanent: true, direction: 'top', className: 'text-xs font-bold px-2.5 py-1 rounded-md border-indigo-200 bg-indigo-50 text-indigo-905 shadow-sm shadow-indigo-500/10' });
+      .bindTooltip(escapeHtml(hotelConfig.name), { permanent: true, direction: 'top', className: 'text-xs font-bold px-2.5 py-1 rounded-md border-indigo-200 bg-indigo-50 text-indigo-900 shadow-sm shadow-indigo-500/10' });
 
     hotelMarkerRef.current = hotelMarker;
 
@@ -201,7 +219,7 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
     if (!map || !marker) return;
 
     marker.setLatLng([hotelConfig.latitude, hotelConfig.longitude]);
-    marker.setTooltipContent(hotelConfig.name);
+    marker.setTooltipContent(escapeHtml(hotelConfig.name));
     map.panTo([hotelConfig.latitude, hotelConfig.longitude]);
   }, [hotelConfig.latitude, hotelConfig.longitude, hotelConfig.name, mapLoaded]);
 
@@ -236,19 +254,6 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
 
   }, [userLocation]);
 
-  // Local calculation of distance to ensure instant updates with Simulated movement
-  const computeDistanceLocal = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
-    const R = 6371000;
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = 
-      Math.sin(dLat/2) * Math.sin(dLat/2) +
-      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-      Math.sin(dLon/2) * Math.sin(dLon/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return Math.round(R * c);
-  };
-
   // Re-draw Pins on tag click / spot collection adjustments
   useEffect(() => {
     const map = mapInstanceRef.current;
@@ -262,54 +267,23 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
     });
     markersRef.current = {};
 
-    // Add Pins
-    spots.forEach(spot => {
+    // Add Pins: a uniform circular badge for every category (color + emoji come from the
+    // category the spot references), since a per-type shape stops making sense once staff
+    // can add an arbitrary number of categories — color and emoji are what stay distinctive.
+    visibleSpots.forEach(spot => {
       const isSelected = selectedSpot?.id === spot.id;
-      const isStaffPick = spot.source === 'hotel_master';
-      
-      let colorClass = 'bg-blue-600';
-      let iconSvg = '';
+      const category = getCategory(spot.type);
 
-      if (spot.type === 'restaurant') {
-        colorClass = 'bg-emerald-500';
-        iconSvg = `
-          <svg class="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6" />
-          </svg>
-        `;
-      } else if (spot.type === 'event') {
-        colorClass = 'bg-rose-500';
-        iconSvg = `
-          <svg class="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-          </svg>
-        `;
-      } else {
-        colorClass = 'bg-purple-500';
-        iconSvg = `
-          <svg class="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
-            <path stroke-linecap="round" stroke-linejoin="round" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
-          </svg>
-        `;
-      }
-
-      const outerClass = isSelected 
-        ? 'scale-125 z-[999] ring-2 ring-offset-2 ring-indigo-600' 
-        : isStaffPick 
-          ? 'star-pulse-marker border-2 border-white' 
-          : 'hover:scale-110 border border-white';
+      const outerClass = isSelected
+        ? 'scale-125 z-[999] ring-2 ring-offset-2 ring-indigo-600'
+        : 'hover:scale-110 border-2 border-white';
 
       const pinHtml = `
         <div class="relative group duration-150 flex flex-col items-center">
-          <div class="w-9 h-9 ${isStaffPick ? 'bg-amber-400' : colorClass} rounded-full flex items-center justify-center shadow-lg ${outerClass}">
-            ${isStaffPick ? `
-              <svg class="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z" />
-              </svg>
-            ` : iconSvg}
+          <div class="w-10 h-10 rounded-full flex items-center justify-center shadow-lg text-lg leading-none ${outerClass}" style="background-color: ${escapeHtml(category.color)}">
+            ${escapeHtml(category.emoji)}
           </div>
-          <div class="absolute -bottom-1 w-2.5 h-2.5 ${isStaffPick ? 'bg-amber-400' : colorClass} rotate-45 z-0"></div>
+          <div class="absolute -bottom-1 w-2.5 h-2.5 rotate-45 z-0" style="background-color: ${escapeHtml(category.color)}"></div>
         </div>
       `;
 
@@ -320,11 +294,11 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
         iconAnchor: [20, 36]
       });
 
-      const googleMapsUrlStr = spot.google_maps_url || `https://www.google.com/maps/search/?api=1&query=${spot.latitude},${spot.longitude}`;
+      const googleMapsUrlStr = safeHttpUrl(spot.google_maps_url) || `https://www.google.com/maps/search/?api=1&query=${spot.latitude},${spot.longitude}`;
       const popupHtml = `
         <div class="p-1 font-sans text-slate-800" style="min-width: 120px;">
-          <p class="font-bold text-xs mb-1">${spot.name[lang] || spot.name.ja}</p>
-          <a href="${googleMapsUrlStr}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center text-[10px] font-bold text-indigo-600 hover:underline">
+          <p class="font-bold text-xs mb-1">${escapeHtml(spot.name[lang] || spot.name.ja)}</p>
+          <a href="${escapeHtml(googleMapsUrlStr)}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center text-[10px] font-bold text-indigo-600 hover:underline">
             ${t('openInGoogleMaps')} ↗
           </a>
         </div>
@@ -341,7 +315,7 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
       markersRef.current[spot.id] = marker;
     });
 
-  }, [spots, selectedSpot, mapLoaded, hotelConfig, lang]);
+  }, [visibleSpots, selectedSpot, mapLoaded, hotelConfig, lang, categories]);
 
   // Track user real-time position with browser Geolocator
   const toggleGpsTracking = () => {
@@ -388,14 +362,6 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
     return text;
   };
 
-  // Compute live user distance to the currently activated spot
-  const getLiveSpotDetails = (spot: Spot) => {
-    // Distance from current location (simulated or real GPS)
-    const dist = computeDistanceLocal(userLocation.lat, userLocation.lng, spot.latitude, spot.longitude);
-    const min = Math.max(1, Math.ceil(dist / 80)); // 80m per min
-    return { dist, min };
-  };
-
   // Navigation Deeplink builder
   const closeSheet = () => {
     animate(sheetY, window.innerHeight, { type: 'spring', damping: 28, stiffness: 200 })
@@ -406,9 +372,10 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
   };
 
   const handleNavigationRedirect = (spot: Spot) => {
-    // Prefer registered Google Maps URL if available
-    if (spot.google_maps_url && spot.google_maps_url.trim() !== '') {
-      window.open(spot.google_maps_url, '_blank');
+    // Prefer registered Google Maps URL if available (http/https links only)
+    const registeredUrl = safeHttpUrl(spot.google_maps_url);
+    if (registeredUrl) {
+      window.open(registeredUrl, '_blank', 'noopener,noreferrer');
       return;
     }
 
@@ -424,7 +391,7 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
     <div className="relative w-full h-[100dvh] bg-slate-900 flex flex-col overflow-hidden select-none">
       
       {/* 1. TOP MOBILE HEADER (fixed, always the topmost layer above any sheet/panel/menu) */}
-      <header className="fixed top-0 left-0 right-0 h-14 bg-white border-b border-slate-250 flex items-center justify-between px-5 shrink-0 z-[1500] shadow-sm">
+      <header className="fixed top-0 left-0 right-0 h-14 bg-white border-b border-slate-200 flex items-center justify-between px-5 shrink-0 z-[1500] shadow-sm">
         <div className="flex items-center gap-2">
           <h1 className="font-bold text-slate-800 tracking-tight text-sm leading-none">
             {hotelConfig.name}
@@ -502,24 +469,40 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
               animate={{ y: '0%' }}
               exit={{ y: '100%' }}
               transition={{ type: 'spring', damping: 28, stiffness: 240 }}
+              drag="y"
+              dragControls={calendarDragControls}
+              dragListener={false}
+              dragConstraints={{ top: 0 }}
+              dragElastic={{ top: 0.1, bottom: 0.5 }}
+              onDragEnd={(_, info) => {
+                if (info.offset.y > 120 || info.velocity.y > 500) {
+                  setIsCalendarOpen(false);
+                }
+              }}
               className="fixed bottom-0 left-0 right-0 bg-white rounded-t-3xl shadow-2xl z-[1300] overflow-hidden flex flex-col"
               style={{ maxHeight: '75dvh' }}
             >
-              <div className="p-5 border-b border-slate-100 flex items-start justify-between gap-3 shrink-0">
-                <div>
-                  <h2 className="text-base font-extrabold text-slate-900 flex items-center gap-1.5">
-                    <Calendar className="w-4.5 h-4.5 text-rose-500" />
-                    {t('eventCalendarTitle')}
-                  </h2>
-                  <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">{t('eventCalendarSubtitle')}</p>
-                </div>
+              {/* Sheet handle: same drag-to-dismiss + close button affordance as the spot detail sheet */}
+              <div
+                className="relative h-10 w-full flex items-center justify-center shrink-0 cursor-grab active:cursor-grabbing touch-none"
+                onPointerDown={(e) => calendarDragControls.start(e)}
+              >
+                <div className="w-12 h-1.5 bg-slate-300 rounded-full"></div>
                 <button
                   id="btn-calendar-close"
                   onClick={() => setIsCalendarOpen(false)}
-                  className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 shrink-0"
+                  className="absolute right-3 top-1.5 w-7 h-7 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 flex items-center justify-center transition"
                 >
-                  <ChevronDown className="w-4.5 h-4.5" />
+                  <ChevronDown className="w-4 h-4" />
                 </button>
+              </div>
+
+              <div className="px-5 pb-3 border-b border-slate-100 shrink-0">
+                <h2 className="text-base font-extrabold text-slate-900 flex items-center gap-1.5">
+                  <Calendar className="w-4.5 h-4.5 text-rose-500" />
+                  {t('eventCalendarTitle')}
+                </h2>
+                <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">{t('eventCalendarSubtitle')}</p>
               </div>
 
               <div className="flex-1 overflow-y-auto overscroll-contain p-5 space-y-3">
@@ -534,7 +517,7 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
                       )}
                       <div className="flex items-center justify-between mt-2.5">
                         <span className="text-[10px] text-slate-400 font-medium">
-                          {ev.publishedAt ? new Date(ev.publishedAt).toLocaleDateString(lang === 'ja' ? 'ja-JP' : 'en-US') : ''}
+                          {formatCalendarEventDate(ev, lang === 'ja' ? 'ja-JP' : 'en-US')}
                         </span>
                         {ev.link && (
                           <a
@@ -555,6 +538,43 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
           </>
         )}
       </AnimatePresence>
+
+      {/* CATEGORY FILTER CHIPS: lets guests show only one spot type on the map at a time */}
+      <div
+        aria-label={t('filterTitle')}
+        className="fixed top-14 left-0 right-0 z-[1050] px-4 py-2.5 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm flex items-center gap-2 overflow-x-auto"
+      >
+        <button
+          id="btn-type-filter-all"
+          onClick={() => setTypeFilter('all')}
+          className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-bold border transition-colors ${
+            typeFilter === 'all'
+              ? 'bg-indigo-900 text-white border-indigo-900'
+              : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+          }`}
+        >
+          {t('categoryAll')}
+        </button>
+        {categories.map(cat => {
+          const isActive = typeFilter === cat.id;
+          return (
+            <button
+              key={cat.id}
+              id={`btn-type-filter-${cat.id}`}
+              onClick={() => setTypeFilter(cat.id)}
+              style={isActive ? { backgroundColor: cat.color, borderColor: cat.color } : undefined}
+              className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border transition-colors ${
+                isActive
+                  ? 'text-white'
+                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <span>{cat.emoji}</span>
+              {cat.label}
+            </button>
+          );
+        })}
+      </div>
 
       {/* 2. LEAFLET MAP ELEMENT */}
       <div 
@@ -620,30 +640,20 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
               <div className="px-6 pt-2">
                 {/* Badges */}
                 <div className="flex gap-1.5 mb-2">
-                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded uppercase ${
-                    selectedSpot.source === 'hotel_master' ? 'bg-amber-100 text-amber-800' : 'bg-indigo-50 text-indigo-800'
-                  }`}>
-                    {selectedSpot.source === 'hotel_master' ? t('spotLabelHotelSelected') : t('spotLabelGeneral')}
-                  </span>
-                  <span className="text-[10px] font-bold bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded uppercase">
-                    {selectedSpot.type === 'restaurant' ? t('categoryRestaurant') : selectedSpot.type === 'event' ? t('categoryEvent') : t('categorySightseeing')}
+                  <span
+                    className="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase inline-flex items-center gap-1"
+                    style={{ backgroundColor: `${getCategory(selectedSpot.type).color}1a`, color: getCategory(selectedSpot.type).color }}
+                  >
+                    <span>{getCategory(selectedSpot.type).emoji}</span>
+                    {getCategory(selectedSpot.type).label}
                   </span>
                 </div>
 
-                {/* Name + live distance */}
-                <div className="flex justify-between items-start gap-4 mb-3">
+                {/* Name */}
+                <div className="mb-3">
                   <h2 className="text-xl font-extrabold text-slate-900 leading-tight">
                     {selectedSpot.name[lang] || selectedSpot.name.ja}
                   </h2>
-                  {(() => {
-                    const { dist, min } = getLiveSpotDetails(selectedSpot);
-                    return (
-                      <div className="text-xs font-bold text-indigo-600 flex items-center justify-end gap-1 shrink-0 mt-1">
-                        <span>{t('distanceWalk', { min, dist }).split(' / ')[0]}</span>
-                        <span className="text-[10px] text-slate-400">/ {dist}m</span>
-                      </div>
-                    );
-                  })()}
                 </div>
 
                 {/* Event timeframe display */}
@@ -673,14 +683,23 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
                 )}
               </div>
 
-              {/* Cover Photo */}
-              <div className="relative h-44 md:h-52 bg-slate-200 w-full overflow-hidden mt-5">
-                <img
-                  src={(selectedSpot.image_urls && selectedSpot.image_urls[0]) || 'https://images.unsplash.com/photo-1542051841857-5f90071e7989?w=600'}
-                  alt={selectedSpot.name[lang] || selectedSpot.name.ja}
-                  className="w-full h-full object-cover"
-                  referrerPolicy="no-referrer"
-                />
+              {/* Cover Photo: only rendered when staff actually uploaded one. No stock-photo
+                  fallback, so an untouched spot honestly shows "no photo" instead of a
+                  photo nobody chose. */}
+              <div className="relative h-44 md:h-52 bg-slate-100 w-full overflow-hidden mt-5">
+                {selectedSpot.image_urls && selectedSpot.image_urls[0] ? (
+                  <img
+                    src={selectedSpot.image_urls[0]}
+                    alt={selectedSpot.name[lang] || selectedSpot.name.ja}
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <div className="w-full h-full flex flex-col items-center justify-center text-slate-300">
+                    <ImageOff className="w-8 h-8 mb-1" />
+                    <span className="text-[10px] font-semibold">No Photo</span>
+                  </div>
+                )}
               </div>
 
               {/* Google Maps link banner */}
@@ -700,7 +719,7 @@ export default function GuestView({ onGoToCms }: GuestViewProps) {
       )}
 
       {/* NO SPOTS FOOTER */}
-      {spots.length === 0 && (
+      {visibleSpots.length === 0 && (
         <div className="absolute bottom-20 left-4 right-4 bg-white rounded-2xl border border-rose-100 p-4 text-center shadow-lg z-50 animate-fade-in">
           <Info className="w-6 h-6 text-rose-500 mx-auto mb-1" />
           <p className="text-xs text-slate-600">

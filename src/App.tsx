@@ -3,9 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, lazy, Suspense } from 'react';
 import GuestView from './components/GuestView';
-import CmsView from './components/CmsView';
+
+// Guests (the vast majority of visitors, on hotel Wi-Fi / mobile networks via QR code)
+// never open the CMS, so its code — including the QR generation library — is split out
+// and only downloaded when staff actually switch to the CMS view.
+const CmsView = lazy(() => import('./components/CmsView'));
 
 export default function App() {
   const [view, setView] = useState<'guest' | 'cms'>(() => {
@@ -29,9 +33,17 @@ export default function App() {
   return (
     <div className="w-full min-h-screen bg-slate-900 overflow-hidden font-sans">
       {view === 'guest' ? (
-        <GuestView onGoToCms={() => setView('cms')} />
+        <GuestView />
       ) : (
-        <CmsView onBackToGuest={() => setView('guest')} />
+        <Suspense
+          fallback={
+            <div className="min-h-screen flex items-center justify-center text-slate-400 text-xs font-bold tracking-wider">
+              管理画面を読み込み中...
+            </div>
+          }
+        >
+          <CmsView onBackToGuest={() => setView('guest')} />
+        </Suspense>
       )}
     </div>
   );

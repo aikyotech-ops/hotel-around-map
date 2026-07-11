@@ -97,6 +97,29 @@ export default function GuestView() {
     }
   }, [selectedSpot]);
 
+  // Keeps the spot detail sheet's content area draggable-from-anywhere while still
+  // letting long content scroll natively. touch-action must be correct *before* a touch
+  // begins (real touch devices don't honor changing it mid-gesture), so it's kept in sync
+  // here — via the sheet's position and the content's scroll position — instead of being
+  // decided inside the pointerdown handler itself. Only claim the touch for dragging the
+  // sheet while it isn't fully expanded yet and its content hasn't been scrolled down;
+  // once fully open, hand touches back to native scrolling so long descriptions work.
+  useEffect(() => {
+    const content = sheetContentRef.current;
+    if (!content) return;
+    const updateTouchAction = () => {
+      const notFullyOpen = sheetY.get() > 1;
+      content.style.touchAction = notFullyOpen && content.scrollTop <= 0 ? 'none' : 'pan-y';
+    };
+    updateTouchAction();
+    const unsubscribe = sheetY.on('change', updateTouchAction);
+    content.addEventListener('scroll', updateTouchAction);
+    return () => {
+      unsubscribe();
+      content.removeEventListener('scroll', updateTouchAction);
+    };
+  }, [sheetVisible]);
+
   // GPS State
   const [gpsActive, setGpsActive] = useState<boolean>(false);
   const [userLocation, setUserLocation] = useState<Coords>({
@@ -625,13 +648,17 @@ export default function GuestView() {
             }
           }}
           onPointerDownCapture={(e) => {
-            // Let taps on real controls (buttons/links) work normally, and don't hijack
-            // an in-progress scroll of the content area — only take over the sheet drag
-            // when the pointer starts on the content while it's already scrolled to top.
+            // Let taps on real controls (buttons/links) work normally.
             const target = e.target as HTMLElement;
             if (target.closest('button, a, input, textarea, select')) return;
             const content = sheetContentRef.current;
-            if (content && content.contains(target) && content.scrollTop > 0) return;
+            if (content && content.contains(target)) {
+              // Mirrors the touch-action logic in the effect above: once the sheet is
+              // fully open, or the content has been scrolled down, hand this touch to
+              // native scrolling instead of the sheet drag.
+              const notFullyOpen = sheetY.get() > 1;
+              if (!notFullyOpen || content.scrollTop > 0) return;
+            }
             dragControls.start(e);
           }}
           className="absolute bottom-0 left-0 right-0 bg-white rounded-t-3xl border-t border-slate-100 shadow-2xl z-[1001] overflow-hidden flex flex-col"
@@ -649,7 +676,8 @@ export default function GuestView() {
           </div>
 
             {/* Main Content Area (scrollable; overscroll-contain stops the scroll bounce from
-                revealing the dark page background behind the sheet) */}
+                revealing the dark page background behind the sheet). touch-action is kept
+                in sync by the effect above instead of being set here directly. */}
             <div ref={sheetContentRef} className="flex-1 overflow-y-auto overscroll-contain pb-8">
               <div className="px-6 pt-2">
                 {/* Badges */}

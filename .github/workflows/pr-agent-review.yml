@@ -4,12 +4,17 @@ on:
   pull_request:
     types: [opened, reopened, synchronize]
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   review:
     runs-on: [self-hosted, ollama-local]
     steps:
       - name: Run PR-Agent review (Ollama)
-        shell: pwsh
+        shell: powershell
         env:
           GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CONFIG__MODEL: "ollama/qwen3-coder:30b"
